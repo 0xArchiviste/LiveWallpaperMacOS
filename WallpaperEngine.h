@@ -96,6 +96,9 @@
 
 -(void) nextWallpaper;
 
+- (void)notifyAutoPauseSettingChanged;
+- (void)notifyLockScreenLiveSettingChanged;
+
 -(void) startPlaylist;
 - (void)startWallpaperRotation;
 - (void)stopWallpaperRotation;
