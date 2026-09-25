@@ -23,6 +23,8 @@
 "random_on_startup" = "Random Wallpaper on Startup";
 "random_on_lid" = "Random Wallpaper on Lid Wakeup (Requires Application Restart)";
 "pause_when_active" = "Pause When App is Active";
+"lock_screen_live" = "Live Wallpaper on Lock Screen";
+"lock_screen_live_footer" = "Animates the lock screen by updating the system desktop picture while locked. Lower FPS than on the desktop; may look softer on some macOS versions.";
 "video_volume" = "Video Volume";
 "video_fps" = "Video FPS";
 "video_fps_native_format" = "Video: %d FPS";

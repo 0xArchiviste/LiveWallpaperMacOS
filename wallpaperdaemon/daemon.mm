@@ -32,6 +32,11 @@
 #include <float.h>
 
 #include "../DisplayManager.h"
+#include "../SharedConstants.h"
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 @interface VideoWallpaperDaemon : NSObject
 @property(strong) NSMutableArray<NSWindow *> *windows;
@@ -70,6 +75,11 @@
 @property(nonatomic, assign) BOOL assetLoadInProgress;
 @property(nonatomic, strong) id playerItemObserver;
 @property(nonatomic, strong) id playerItemFailObserver;
+@property(nonatomic, strong) AVPlayerItemVideoOutput *lockScreenVideoOutput;
+@property(nonatomic, strong) NSTimer *lockScreenFrameTimer;
+@property(nonatomic, strong) CIContext *lockScreenCIContext;
+@property(nonatomic, strong) NSString *lockScreenJPEGPath;
+@property(nonatomic, assign) BOOL lockScreenPumpActive;
 
 - (instancetype)initWithVideo:(NSString *)videoPath
                   frameOutput:(NSString *)framePath
@@ -81,6 +91,14 @@
 - (void)reassertDesktopWindowGeometry;
 - (void)ensureStaticFrameExists;
 - (CGSize)pixelSizeForTargetScreen;
+- (BOOL)isLockScreenLiveEnabled;
+- (double)lockScreenPumpFPS;
+- (void)startLockScreenFramePumpIfNeeded;
+- (void)stopLockScreenFramePump;
+- (void)lockScreenFrameTick:(NSTimer *)timer;
+- (BOOL)pushCurrentVideoFrameToDesktopPicture;
+- (NSDictionary *)desktopImageOptions;
+- (BOOL)setDesktopImageAtPath:(NSString *)imagePath;
 NSScreen *ScreenForDisplayID(CGDirectDisplayID displayID);
 @end
 
@@ -463,6 +481,8 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
 }
 
 - (void)teardownPlayersKeepingWindows:(BOOL)keepWindows {
+  [self stopLockScreenFramePump];
+  self.lockScreenVideoOutput = nil;
   if (self.playerItemObserver) {
     [[NSNotificationCenter defaultCenter] removeObserver:self.playerItemObserver];
     self.playerItemObserver = nil;
@@ -580,6 +600,19 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
   }
 
   AVPlayerItem *item = [AVPlayerItem playerItemWithAsset:urlAsset];
+
+  NSDictionary *pixelAttrs = @{
+    (NSString *)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (NSString *)kCVPixelBufferIOSurfacePropertiesKey : @{}
+  };
+  self.lockScreenVideoOutput =
+      [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:pixelAttrs];
+  [item addOutput:self.lockScreenVideoOutput];
+  if (_framePath.length) {
+    _lockScreenJPEGPath =
+        [[_framePath stringByDeletingPathExtension] stringByAppendingPathExtension:@"lock.jpg"];
+  }
+
   // "tracks" was preloaded above, so synchronous track access is safe here.
   {
 #pragma clang diagnostic push
@@ -787,18 +820,28 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
   NSLog(@"[Daemon] Screen locked - saving playback state: %@",
         self.wasPlayingBeforeSleep ? @"playing" : @"paused");
   self.screen_locked = true;
-  for (AVQueuePlayer *player in _players) {
-    [player pause];
+  if ([self isLockScreenLiveEnabled]) {
+    NSLog(@"[Daemon] Lock-screen live wallpaper enabled — keeping playback for frame pump");
+    [self startLockScreenFramePumpIfNeeded];
+    [self checkAndUpdatePlaybackState];
+  } else {
+    [self stopLockScreenFramePump];
+    for (AVQueuePlayer *player in _players) {
+      [player pause];
+    }
   }
 }
 
 - (void)screenUnlocked:(NSNotification *)note {
   NSLog(@"[Daemon] Screen unlocked");
   self.screen_locked = false;
+  [self stopLockScreenFramePump];
   if (self.wasPlayingBeforeSleep) {
     NSLog(@"[Daemon] Resuming playback after screen unlock");
     [self resumeAllPlayers];
   }
+  // Re-sync the static PNG used under desktop icons with the current video frame.
+  [self setStaticWallpaper];
   dispatch_after(
       dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
       dispatch_get_main_queue(), ^{
@@ -807,6 +850,7 @@ static void DisplayReconfigCallback(CGDirectDisplayID display,
 }
 
 - (void)dealloc {
+  [self stopLockScreenFramePump];
   CGDisplayRemoveReconfigurationCallback(DisplayReconfigCallback,
                                          (__bridge void *)self);
   [self teardownPlayersKeepingWindows:NO];
@@ -853,12 +897,19 @@ static void terminateWallpaperDaemonCallback(CFNotificationCenterRef center,
     self.lastVisibilitySample = now;
   }
 
-  BOOL shouldPause = screenLocked;
+  BOOL lockScreenLive = [self isLockScreenLiveEnabled];
+  BOOL shouldPause = screenLocked && !lockScreenLive;
+
+  if (screenLocked && lockScreenLive) {
+    [self startLockScreenFramePumpIfNeeded];
+  } else {
+    [self stopLockScreenFramePump];
+  }
 
   // Auto-pause when another app is frontmost (Finder + self exempt).
   // Fullscreen apps still pause under this policy — geometry is reasserted so
   // wallpaper is ready the instant the fullscreen Space is torn down.
-  if (!shouldPause && self.autoPauseEnabled) {
+  if (!shouldPause && self.autoPauseEnabled && !screenLocked) {
     shouldPause = ![self isFrontmostAppAllowed];
   }
 
@@ -1395,6 +1446,234 @@ static const struct { double num; double den; } kNiceRatios[10] = {
                                            forKey:@"wallpapervolume"];
 }
 
+- (BOOL)isLockScreenLiveEnabled {
+  NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+  if ([defaults objectForKey:kLockScreenLiveWallpaperKey] == nil)
+    return YES;
+  return [defaults boolForKey:kLockScreenLiveWallpaperKey];
+}
+
+- (double)lockScreenPumpFPS {
+  double fps = [[NSUserDefaults standardUserDefaults] doubleForKey:kLockScreenLiveFPSKey];
+  if (fps < 4.0 || fps > 24.0 || !isfinite(fps))
+    fps = kLockScreenLiveDefaultFPS;
+  return fps;
+}
+
+- (NSDictionary *)desktopImageOptions {
+  NSInteger scaleMode =
+      [[NSUserDefaults standardUserDefaults] integerForKey:@"scale_mode"];
+
+  NSImageScaling scaling = NSImageScaleProportionallyUpOrDown;
+  BOOL allowClipping = NO;
+
+  switch (scaleMode) {
+  case 0:
+    scaling = NSImageScaleProportionallyUpOrDown;
+    allowClipping = YES;
+    break;
+  case 1:
+    scaling = NSImageScaleProportionallyUpOrDown;
+    allowClipping = NO;
+    break;
+  case 2:
+    scaling = NSImageScaleAxesIndependently;
+    allowClipping = NO;
+    break;
+  case 3:
+    scaling = NSImageScaleNone;
+    allowClipping = NO;
+    break;
+  case 4:
+    scaling = NSImageScaleProportionallyUpOrDown;
+    allowClipping = YES;
+    break;
+  default:
+    break;
+  }
+  return @{
+    NSWorkspaceDesktopImageScalingKey : @(scaling),
+    NSWorkspaceDesktopImageAllowClippingKey : @(allowClipping),
+    NSWorkspaceDesktopImageFillColorKey : [NSColor blackColor]
+  };
+}
+
+- (void)syncDesktopPicturePreferencesForPath:(NSString *)imagePath {
+  if (!_targetScreen || !imagePath.length)
+    return;
+
+  NSDictionary *options = [self desktopImageOptions];
+  NSNumber *scaling = options[NSWorkspaceDesktopImageScalingKey];
+  NSNumber *allowClipping = options[NSWorkspaceDesktopImageAllowClippingKey];
+
+  std::string uuidString = DisplayUUIDFromID(
+      (CGDirectDisplayID)[_targetScreen.deviceDescription[@"NSScreenNumber"]
+                             unsignedIntValue]);
+  if (uuidString.empty())
+    return;
+
+  NSString *uuid = [NSString stringWithUTF8String:uuidString.c_str()];
+  NSURL *imageURL = [NSURL fileURLWithPath:imagePath];
+  NSMutableDictionary *desktopSpec = [NSMutableDictionary dictionary];
+  desktopSpec[@"ImageFilePath"] = imagePath;
+  desktopSpec[@"ImageFileURL"] = [imageURL absoluteString];
+  desktopSpec[@"NewDisplayDictionary"] = @{
+    @"desktop-picture-options" : @{
+      @"picture-options" : scaling ?: @(NSImageScaleProportionallyUpOrDown),
+      @"allow-clipping" : allowClipping ?: @NO,
+      @"fill-color" : @"0 0 0"
+    }
+  };
+
+  CFPreferencesSetAppValue((__bridge CFStringRef)uuid,
+                         (__bridge CFPropertyListRef)desktopSpec,
+                         CFSTR("com.apple.desktop"));
+  CFPreferencesAppSynchronize(CFSTR("com.apple.desktop"));
+}
+
+- (BOOL)setDesktopImageAtPath:(NSString *)imagePath {
+  if (!imagePath.length || !_targetScreen)
+    return NO;
+  if (![[NSFileManager defaultManager] fileExistsAtPath:imagePath])
+    return NO;
+
+  NSURL *imageURL = [NSURL fileURLWithPath:imagePath];
+  NSError *error = nil;
+  BOOL success = [[NSWorkspace sharedWorkspace] setDesktopImageURL:imageURL
+                                                         forScreen:_targetScreen
+                                                           options:[self desktopImageOptions]
+                                                             error:&error];
+  if (!success) {
+    NSLog(@"[Daemon] setDesktopImageAtPath failed: %@", error.localizedDescription);
+  }
+  return success;
+}
+
+- (void)startLockScreenFramePumpIfNeeded {
+  if (![self isLockScreenLiveEnabled] || !self.screen_locked)
+    return;
+  if (!_lockScreenVideoOutput || _players.count == 0)
+    return;
+  if (self.lockScreenPumpActive)
+    return;
+
+  self.lockScreenPumpActive = YES;
+  double fps = [self lockScreenPumpFPS];
+  NSTimeInterval interval = 1.0 / fps;
+  self.lockScreenFrameTimer =
+      [NSTimer timerWithTimeInterval:interval
+                              target:self
+                            selector:@selector(lockScreenFrameTick:)
+                            userInfo:nil
+                             repeats:YES];
+  self.lockScreenFrameTimer.tolerance = interval * 0.35;
+  [[NSRunLoop mainRunLoop] addTimer:self.lockScreenFrameTimer
+                            forMode:NSRunLoopCommonModes];
+  NSLog(@"[Daemon] Lock-screen frame pump started (%.1f FPS)", fps);
+  [self lockScreenFrameTick:nil];
+}
+
+- (void)stopLockScreenFramePump {
+  if (self.lockScreenFrameTimer) {
+    [self.lockScreenFrameTimer invalidate];
+    self.lockScreenFrameTimer = nil;
+  }
+  if (self.lockScreenPumpActive) {
+    NSLog(@"[Daemon] Lock-screen frame pump stopped");
+  }
+  self.lockScreenPumpActive = NO;
+}
+
+- (void)lockScreenFrameTick:(NSTimer *)timer {
+  (void)timer;
+  if (!self.screen_locked || ![self isLockScreenLiveEnabled]) {
+    [self stopLockScreenFramePump];
+    return;
+  }
+  [self pushCurrentVideoFrameToDesktopPicture];
+}
+
+- (BOOL)pushCurrentVideoFrameToDesktopPicture {
+  if (!_lockScreenVideoOutput || !_lockScreenJPEGPath.length || !_targetScreen)
+    return NO;
+
+  CMTime itemTime =
+      [_lockScreenVideoOutput itemTimeForHostTime:CACurrentMediaTime()];
+  if (![_lockScreenVideoOutput hasNewPixelBufferForItemTime:itemTime])
+    return NO;
+
+  CVPixelBufferRef pixelBuffer =
+      [_lockScreenVideoOutput copyPixelBufferForItemTime:itemTime
+                                      itemTimeForDisplay:NULL];
+  if (!pixelBuffer)
+    return NO;
+
+  CGImageRef cgImage = NULL;
+  OSStatus vtStatus =
+      VTCreateCGImageFromCVPixelBuffer(pixelBuffer, NULL, &cgImage);
+  CVPixelBufferRelease(pixelBuffer);
+  if (vtStatus != noErr || !cgImage)
+    return NO;
+
+  @autoreleasepool {
+    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage);
+    if (!ciImage)
+      return NO;
+
+    CGFloat longEdge = MAX(ciImage.extent.size.width, ciImage.extent.size.height);
+    CGFloat maxLongEdge = 1920.0;
+    if (self.runningOnBattery || self.lowPowerModeEnabled)
+      maxLongEdge = 1280.0;
+    if (longEdge > maxLongEdge) {
+      CGFloat scale = maxLongEdge / longEdge;
+      ciImage = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    }
+
+    if (!self.lockScreenCIContext) {
+      self.lockScreenCIContext = [CIContext contextWithOptions:@{
+        kCIContextUseSoftwareRenderer : @NO
+      }];
+    }
+    CGImageRef scaled = [self.lockScreenCIContext createCGImage:ciImage
+                                                       fromRect:ciImage.extent];
+    if (!scaled)
+      return NO;
+
+    NSString *tmpPath =
+        [_lockScreenJPEGPath stringByAppendingString:@".part"];
+    NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(
+        (__bridge CFURLRef)tmpURL, (__bridge CFStringRef)UTTypeJPEG.identifier, 1,
+        NULL);
+    if (!dest) {
+      CGImageRelease(scaled);
+      return NO;
+    }
+
+    NSDictionary *jpegProps = @{
+      (__bridge NSString *)kCGImageDestinationLossyCompressionQuality : @0.82
+    };
+    CGImageDestinationAddImage(dest, scaled, (__bridge CFDictionaryRef)jpegProps);
+    BOOL wrote = CGImageDestinationFinalize(dest);
+    CFRelease(dest);
+    CGImageRelease(scaled);
+    if (!wrote)
+      return NO;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *moveErr = nil;
+    [fm removeItemAtPath:_lockScreenJPEGPath error:nil];
+    if (![fm moveItemAtPath:tmpPath toPath:_lockScreenJPEGPath error:&moveErr]) {
+      NSLog(@"[Daemon] lock-screen JPEG move failed: %@", moveErr.localizedDescription);
+      return NO;
+    }
+
+    [self syncDesktopPicturePreferencesForPath:_lockScreenJPEGPath];
+    return [self setDesktopImageAtPath:_lockScreenJPEGPath];
+  }
+}
+
 - (bool)setStaticWallpaper {
   @autoreleasepool {
     if (!_framePath)
@@ -1404,78 +1683,8 @@ static const struct { double num; double den; } kNiceRatios[10] = {
     if (!_targetScreen)
       return false;
 
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    NSInteger scaleMode = [defaults integerForKey:@"scale_mode"];
-
-    NSImageScaling scaling = NSImageScaleProportionallyUpOrDown;
-    BOOL allowClipping = NO;
-
-    switch (scaleMode) {
-    case 0:
-      scaling = NSImageScaleProportionallyUpOrDown;
-      allowClipping = YES;
-      break;
-    case 1:
-      scaling = NSImageScaleProportionallyUpOrDown;
-      allowClipping = NO;
-      break;
-    case 2:
-      scaling = NSImageScaleAxesIndependently;
-      allowClipping = NO;
-      break;
-    case 3:
-      scaling = NSImageScaleNone;
-      allowClipping = NO;
-      break;
-    case 4:
-      scaling = NSImageScaleProportionallyUpOrDown;
-      allowClipping = YES;
-      break;
-    default:
-      break;
-    }
-    NSDictionary *options = @{
-      NSWorkspaceDesktopImageScalingKey : @(scaling),
-      NSWorkspaceDesktopImageAllowClippingKey : @(allowClipping),
-      NSWorkspaceDesktopImageFillColorKey : [NSColor blackColor]
-    };
-
-    NSURL *imageURL = [NSURL fileURLWithPath:_framePath];
-    NSError *error = nil;
-
-    {
-      std::string uuidString = DisplayUUIDFromID(
-          (CGDirectDisplayID)[_targetScreen.deviceDescription
-                                  [@"NSScreenNumber"] unsignedIntValue]);
-
-      if (!uuidString.empty()) {
-        NSString *uuid = [NSString stringWithUTF8String:uuidString.c_str()];
-        if (uuid) {
-          NSMutableDictionary *desktopSpec = [NSMutableDictionary dictionary];
-          desktopSpec[@"ImageFilePath"] = _framePath;
-          desktopSpec[@"ImageFileURL"] = [imageURL absoluteString];
-          desktopSpec[@"NewDisplayDictionary"] = @{
-            @"desktop-picture-options" : @{
-              @"picture-options" : @(scaling),
-              @"allow-clipping" : @(allowClipping),
-              @"fill-color" : @"0 0 0"
-            }
-          };
-
-          CFPreferencesSetAppValue((__bridge CFStringRef)uuid,
-                                   (__bridge CFPropertyListRef)desktopSpec,
-                                   CFSTR("com.apple.desktop"));
-          CFPreferencesAppSynchronize(CFSTR("com.apple.desktop"));
-        }
-      }
-    }
-
-    BOOL success =
-        [[NSWorkspace sharedWorkspace] setDesktopImageURL:imageURL
-                                                forScreen:_targetScreen
-                                                  options:options
-                                                    error:&error];
-    return success;
+    [self syncDesktopPicturePreferencesForPath:_framePath];
+    return [self setDesktopImageAtPath:_framePath];
   }
 }
 
@@ -1571,6 +1780,17 @@ static void AutoPauseChangedCallback(CFNotificationCenterRef center,
   [daemon setAutoPauseEnabled:enabled];
 }
 
+static void LockScreenLiveChangedCallback(CFNotificationCenterRef center,
+                                          void *observer, CFStringRef name,
+                                          const void *object,
+                                          CFDictionaryRef userInfo) {
+  VideoWallpaperDaemon *daemon = (__bridge VideoWallpaperDaemon *)observer;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [daemon stopLockScreenFramePump];
+    [daemon checkAndUpdatePlaybackState];
+  });
+}
+
 NSScreen *ScreenForDisplayID(CGDirectDisplayID displayID) {
   for (NSScreen *screen in [NSScreen screens]) {
     NSDictionary *screenDict = [screen deviceDescription];
@@ -1589,6 +1809,12 @@ int main(int argc, const char *argv[]) {
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
     [NSApp finishLaunching];
+
+    [[NSUserDefaults standardUserDefaults]
+        registerDefaults:@{
+          kLockScreenLiveWallpaperKey : @YES,
+          kLockScreenLiveFPSKey : @(kLockScreenLiveDefaultFPS)
+        }];
 
     // argv: 0=bin 1=video 2=frame 3=volume 4=scale [5=uuid]
     if (argc < 5) {
@@ -1673,6 +1899,12 @@ int main(int argc, const char *argv[]) {
         CFNotificationCenterGetDarwinNotifyCenter(),
         (__bridge const void *)(daemon), AutoPauseChangedCallback,
         CFSTR("com.live.wallpaper.autoPauseChanged"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge const void *)(daemon), LockScreenLiveChangedCallback,
+        CFSTR("com.live.wallpaper.lockScreenLiveChanged"), NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
 
     CFNotificationCenterAddObserver(

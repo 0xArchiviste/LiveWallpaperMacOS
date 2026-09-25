@@ -22,4 +22,11 @@
 static const double THUMBNAIL_WIDTH = 300.0;
 static const double THUMBNAIL_HEIGHT = 168.0;
 
+/// When YES (default), refresh the system desktop picture from the playing video
+/// while the screen is locked so the lock/login screen can animate.
+#define kLockScreenLiveWallpaperKey @"lockScreenLiveWallpaper"
+/// Max frames per second pushed to the desktop picture while locked (8–24).
+#define kLockScreenLiveFPSKey @"lockScreenLiveFPS"
+static const double kLockScreenLiveDefaultFPS = 12.0;
+
 #endif /* SharedConstants_h */

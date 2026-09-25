@@ -57,6 +57,12 @@ static NSString *folderPath = nil;
 - (instancetype)init {
   self = [super init];
   if (self) {
+    [[NSUserDefaults standardUserDefaults]
+        registerDefaults:@{
+          kLockScreenLiveWallpaperKey : @YES,
+          kLockScreenLiveFPSKey : @(kLockScreenLiveDefaultFPS)
+        }];
+
     _generatingImages = NO;
     _generatingThumbImages = NO;
     _currentVideoPath = nil;
@@ -1350,6 +1356,18 @@ static NSString *folderPath = nil;
           CFNotificationCenterGetDarwinNotifyCenter(),
           CFSTR("com.live.wallpaper.volumeChanged"), NULL, NULL, true);
     }
+
+- (void)notifyAutoPauseSettingChanged {
+  CFNotificationCenterPostNotification(
+      CFNotificationCenterGetDarwinNotifyCenter(),
+      CFSTR("com.live.wallpaper.autoPauseChanged"), NULL, NULL, true);
+}
+
+- (void)notifyLockScreenLiveSettingChanged {
+  CFNotificationCenterPostNotification(
+      CFNotificationCenterGetDarwinNotifyCenter(),
+      CFSTR("com.live.wallpaper.lockScreenLiveChanged"), NULL, NULL, true);
+}
 
 - (void)updateScaleMode:(NSInteger)mode {
   NSInteger clamped = mode;

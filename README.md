@@ -11,16 +11,19 @@ This is an open-source live wallpaper application for MacOS 14+
 
 Run this on terminal `brew tap thusvill/livewallpaper && brew install --cask livewallpaper`
 
-## Installation(Compile from source)
+## Installation (compile from source)
+
 - macOS 14+
+- Xcode 26+ (SwiftUI branch)
 - git
-- Xcode
-- Cmake
-  
-Run this:
+
 ```bash
-git clone --single-branch --branch objectiveC https://github.com/thusvill/LiveWallpaperMacOS.git && cd LiveWallpaperMacOS && mkdir -p build && cd build && cmake .. && make -j$(sysctl -n hw.ncpu) 
+git clone https://github.com/0xArchiviste/LiveWallpaperMacOS.git
+cd LiveWallpaperMacOS
+xcodebuild -scheme LiveWallpaper -configuration Release -destination 'platform=macOS' build
 ```
+
+Open `LiveWallpaper.xcodeproj` in Xcode and run the **LiveWallpaper** scheme. The helper **wallpaperdaemon** is copied into the app bundle automatically.
 
 ## Guide for DMG Installation
 
@@ -58,8 +61,40 @@ Post bugs with result of following command.
 
 > ![Application](./asset/application.png)
 
-> ## This is a static image, currently LiveWallpaper doesn't support videos on the lock screen.
+> Lock screen can show an **animated** live wallpaper (see [Lock screen live wallpaper](#lock-screen-live-wallpaper)).
 > ![lockscreen](./asset/lockscreen.png)
+
+## Lock screen live wallpaper
+
+Desktop live video is drawn by **wallpaperdaemon** in a borderless window at the desktop window level. macOS does **not** expose a public API to play arbitrary video inside `loginwindow` on the lock screen. The lock/login UI instead shows the per-display **system desktop picture** (the same asset set via `NSWorkspace setDesktopImageURL:`).
+
+LiveWallpaper keeps the desktop behavior unchanged and, when **Live Wallpaper on Lock Screen** is enabled (Settings, on by default):
+
+1. On screen lock, playback continues in the daemon (video is not paused solely because of lock).
+2. A lightweight **frame pump** (~12 FPS by default) samples the playing video via `AVPlayerItemVideoOutput`, writes a JPEG, and refreshes the system desktop picture for that display.
+3. On unlock, the pump stops and the usual static PNG under desktop icons is restored.
+
+### Permissions
+
+- No SIP changes, kernel extensions, or private `loginwindow` hooks.
+- Standard file access to your wallpaper folder and the app cache (static frames / lock-screen JPEGs).
+- Accessibility is only used for existing app features (not for lock-screen video).
+
+### Settings
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `lockScreenLiveWallpaper` | `YES` | Animate lock screen from the current video |
+| `lockScreenLiveFPS` | `12` | Max refresh rate while locked (4–24) |
+
+Re-apply a wallpaper or toggle the setting while locked to pick up changes without restarting the daemon.
+
+### Known limitations
+
+- Animation is **not** full desktop quality: lower FPS, JPEG compression, and macOS may soften or blur lock-screen wallpaper updates.
+- Very old static README screenshots may still look like a single frame until you lock the machine with the feature enabled.
+- Each display runs its own daemon; lock-screen animation follows per-display wallpaper assignment.
+- Apple's dynamic HEIC “live” wallpapers use a different system path; this feature is for your own `.mp4` / `.mov` files.
 
 > ![settings](./asset/settings.png)
 

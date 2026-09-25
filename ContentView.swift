@@ -122,6 +122,8 @@ enum L {
     static let randomOnStartup = NSLocalizedString("Random on startup", comment: "")
     static let randomOnLid = NSLocalizedString("Random on lid", comment: "")
     static let pauseWhenActive = NSLocalizedString("Pause when active", comment: "")
+    static let lockScreenLive = NSLocalizedString("lock_screen_live", comment: "")
+    static let lockScreenLiveFooter = NSLocalizedString("lock_screen_live_footer", comment: "")
     static let videoVolume = NSLocalizedString("Video volume", comment: "")
     static let videoFPS = NSLocalizedString("video_fps", comment: "")
     static let videoFPSNativeFormat = NSLocalizedString("video_fps_native_format", comment: "")
@@ -151,6 +153,7 @@ enum UserDefaultsKeys {
     static let randomOnStartup = "random"
     static let randomOnLid = "random_lid"
     static let pauseOnAppFocus = "pauseOnAppFocus"
+    static let lockScreenLive = "lockScreenLiveWallpaper"
     static let volumePercentage = "wallpapervolumeprecentage"
     static let playbackFPS = "wallpaperfps"
     static let playbackSpeed = "wallpaperspeed"
@@ -640,11 +643,39 @@ struct SettingsView: View {
                                 set: {
                                     UserDefaults.standard.set(
                                         $0, forKey: UserDefaultsKeys.pauseOnAppFocus)
+                                    sharedEngine?.notifyAutoPauseSettingChanged()
                                 }
                             )
                         )
                         .toggleStyle(.switch)
                     }
+
+                    SettingRow(title: L.lockScreenLive) {
+                        Toggle(
+                            "",
+                            isOn: Binding(
+                                get: {
+                                    if UserDefaults.standard.object(
+                                        forKey: UserDefaultsKeys.lockScreenLive) == nil {
+                                        return true
+                                    }
+                                    return UserDefaults.standard.bool(
+                                        forKey: UserDefaultsKeys.lockScreenLive)
+                                },
+                                set: {
+                                    UserDefaults.standard.set(
+                                        $0, forKey: UserDefaultsKeys.lockScreenLive)
+                                    sharedEngine?.notifyLockScreenLiveSettingChanged()
+                                }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                    }
+                    Text(L.lockScreenLiveFooter)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 4)
 
                     //Vinttage Bar
                     SettingRow(title: L.vinttageBar) {

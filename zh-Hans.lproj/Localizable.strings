@@ -23,6 +23,8 @@
 "random_on_startup" = "启动时随机壁纸";
 "random_on_lid" = "开盖唤醒时随机壁纸（需要重启应用）";
 "pause_when_active" = "应用激活时暂停";
+"lock_screen_live" = "锁屏动态壁纸";
+"lock_screen_live_footer" = "在锁屏时通过更新系统桌面图片实现动画。帧率低于桌面，部分 macOS 版本可能更柔和或略有延迟。";
 "video_volume" = "视频音量";
 "video_fps" = "视频帧率";
 "video_fps_native_format" = "视频原生：%d FPS";
