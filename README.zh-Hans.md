@@ -52,7 +52,7 @@
 
 > ![Application](./asset/application.png)
 
-> ## 这是静态图片，目前 LiveWallpaper 不支持锁屏播放视频。
+> 锁屏可显示**动态**壁纸（设置中的「锁屏动态壁纸」，默认开启）。原理与限制见英文 README 的 *Lock screen live wallpaper* 章节。
 > ![lockscreen](./asset/lockscreen.png)
 
 > ![settings](./asset/settings.png)

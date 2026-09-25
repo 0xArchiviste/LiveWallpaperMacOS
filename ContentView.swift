@@ -153,7 +153,7 @@ enum UserDefaultsKeys {
     static let randomOnStartup = "random"
     static let randomOnLid = "random_lid"
     static let pauseOnAppFocus = "pauseOnAppFocus"
-    static let lockScreenLive = kLockScreenLiveWallpaperKey
+    static let lockScreenLive = "lockScreenLiveWallpaper"
     static let volumePercentage = "wallpapervolumeprecentage"
     static let playbackFPS = "wallpaperfps"
     static let playbackSpeed = "wallpaperspeed"
